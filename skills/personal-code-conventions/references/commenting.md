@@ -31,3 +31,4 @@ if (!user) return;
 - Use `//` for TypeScript/JavaScript, `/* */` for CSS, `#` for Shell
 - One space after the comment marker
 - Keep comments on their own line above the code they reference, not inline at end of line
+- Never end comments with periods `.`
