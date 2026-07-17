@@ -1,3 +1,3 @@
-# skills
+# agents
 
 [Agent Skills](https://agentskills.io/)
