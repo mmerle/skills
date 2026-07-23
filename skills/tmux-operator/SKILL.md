@@ -1,6 +1,6 @@
 ---
 name: tmux-operator
-description: Operate and reuse tmux sessions, windows, panes, and terminal processes. Use when asked to inspect or capture tmux state, create terminal workspaces, reuse or launch dev servers, run or monitor tests, watchers, or logs, interact with terminal applications, or launch visible workers such as OpenCode instances.
+description: Operate and reuse tmux sessions, windows (tabs), panes, and terminal processes. Use when asked to inspect or capture tmux state, create or edit terminal workspaces, reuse or launch dev servers, run or monitor tests, watchers, or logs, interact with terminal applications, or launch visible workers such as OpenCode instances.
 ---
 
 # tmux Operator
@@ -10,7 +10,7 @@ Use tmux as a shared execution and observation layer. Prefer visible, recoverabl
 ## Operating Contract
 
 - Inspect before acting.
-- Reuse a matching process in the project's existing tmux panes before creating another server, watcher, test process, log stream, or worker.
+- Reuse a matching process in the project's existing tmux panes before creating another server, watcher, test process, log stream, or worker, unless the user explicitly requested a new pane, window, or process.
 - Use the shortest safe path. When creating a pane or window for a known command, launch the command as part of creation instead of creating a shell and typing into it afterward.
 - Keep user-visible terminal output clean. Do not print completion markers or agent bookkeeping into panes by default.
 - Target stable tmux IDs such as `$1` for sessions, `@3` for windows, and `%48` for panes. Never rely on names or indexes because they may be duplicated or renumbered.
@@ -23,6 +23,99 @@ Use tmux as a shared execution and observation layer. Prefer visible, recoverabl
 - Leave created tmux objects available for inspection when work completes.
 
 Prefer an application's dedicated control CLI or API over simulated keystrokes. Use `tmux send-keys` when terminal input is the intended interface or no better control surface exists.
+
+### Latency Rules
+
+- For an explicit operation beside the current pane, query the current context once and act. Do not list panes first.
+- Keep dependent shell capture, tmux mutations, and verification in one terminal tool call. Do not split them into separate agent turns.
+- When all target IDs are already known, batch mutations and final metadata verification through one tmux command queue using `\;`.
+- Set the new pane's percentage or exact size during `split-window` with `-p` or `-l`; do not create it at the default size and resize it afterward.
+- Verify a known command launch with pane metadata. Capture terminal output only when readiness, failure text, interaction state, or command results matter.
+- Do not poll a known CLI that has no requested readiness condition. One launch and one targeted verification are enough.
+
+```bash
+tmux resize-pane -t '%49' -R 5 \; swap-pane -d -s '%49' -t '%50' \; list-panes -t '@3' -F 'pane=#{pane_id} width=#{pane_width} height=#{pane_height}'
+```
+
+## Workspace Layout and Tabs
+
+Tmux windows are tabs. For an explicit split, tab, resize, move, or swap request, inspect only the target window and mutate it directly; do not inventory the session or capture pane output unless the request requires process state. Preserve focus with `-d` by default. Change the visible pane or tab only when the user explicitly asks to focus it.
+
+```bash
+tmux list-panes -t '@3' -F 'window=#{window_id} pane=#{pane_id} active=#{pane_active} width=#{pane_width} height=#{pane_height} path=#{pane_current_path} command=#{pane_current_command}'
+```
+
+Create a tab or pane with its program atomically, retain the returned stable ID, and verify only the affected window's geometry:
+
+```bash
+window_and_pane=$(tmux new-window -d -P -F '#{window_id} #{pane_id}' -t '$1' -n 'monitor' -c '/absolute/cwd' btop)
+pane_id=$(tmux split-window -h -d -p 40 -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd' btop)
+pane_id=$(tmux split-window -h -d -l 80 -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd' btop)
+tmux list-panes -t '@3' -F 'pane=#{pane_id} width=#{pane_width} height=#{pane_height}'
+```
+
+Use `-p` when the user describes a ratio and `-l` when a CLI needs an exact minimum width or height. With `-h`, `-l` is columns; with `-v`, it is rows.
+
+Use the exact returned IDs for the requested mutation:
+
+```bash
+tmux rename-window -t '@3' 'monitor'
+tmux resize-pane -t '%49' -x 80 -y 24
+tmux swap-pane -d -s '%48' -t '%49'
+tmux join-pane -d -h -s '%50' -t '%49'
+tmux break-pane -d -P -F '#{window_id}' -s '%50'
+tmux move-window -s '@4' -t '$1:2'
+tmux select-window -t '@3'
+tmux select-pane -t '%49'
+tmux select-pane -T 'monitor' -t '%49'
+tmux resize-pane -Z -t '%49'
+tmux select-layout -t '@3' even-horizontal
+tmux rotate-window -D -t '@3'
+```
+
+`join-pane`, `break-pane`, and `move-window` relocate existing work rather than restarting it. They may remove an empty source window. Do not use `kill-pane` or `kill-window` unless the user explicitly asks to close it.
+
+## Adjacent Pane Fast Path
+
+Use this path when the user explicitly asks to open a new split beside the current work and run or interact with a CLI there. The explicit request for a new split overrides process reuse. Do not inventory unrelated panes, inspect geometry, create an empty shell first, or search for duplicate processes unless the request itself requires one of those steps.
+
+1. Inspect the current pane once using the standard context command below.
+2. Preserve `pane_current_path`, keep focus on the current pane with `-d`, and default to a right split with `-h` unless the user requests another direction.
+3. Launch the CLI directly as part of `split-window`. Apply a requested ratio or known minimum size in the same command. Pass the executable and its arguments separately; do not build shell source when direct argv is sufficient.
+4. Record the returned pane ID, then verify only that pane's command and cwd. Include initial output only when the task depends on it.
+5. Interact with the verified pane using literal text and a separate submit key.
+
+For example, open OpenCode directly in a visible split without moving focus:
+
+```bash
+target=${TMUX_PANE:?not inside tmux}
+cwd=$(tmux display-message -p -t "$target" '#{pane_current_path}')
+pane_id=$(tmux split-window -h -d -P -F '#{pane_id}' -t "$target" -c "$cwd" opencode)
+```
+
+The same form works for any known executable and preserves argument boundaries:
+
+```bash
+pane_id=$(tmux split-window -h -d -P -F '#{pane_id}' -t "$target" -c "$cwd" lazygit)
+pane_id=$(tmux split-window -h -d -P -F '#{pane_id}' -t "$target" -c "$cwd" opencode --prompt "$prompt")
+pane_id=$(tmux split-window -h -d -l 80 -P -F '#{pane_id}' -t "$target" -c "$cwd" btop)
+```
+
+If a right split fails because the pane is too narrow, retry once with `-v`; do not precompute layout geometry. When a CLI's minimum size is already known, use `-l` during creation. If the CLI reports an unknown minimum after launch, inspect only the target window, resize the new pane to that minimum when its existing layout permits it, then recapture. For example, `btop` requires at least 80 columns and 24 rows with its default layout. Do not close, move, or replace another pane to satisfy a TUI's minimum size without an explicit request. Immediately verify the returned pane:
+
+```bash
+tmux display-message -p -t "$pane_id" 'pane=#{pane_id} command=#{pane_current_command} path=#{pane_current_path}' \; capture-pane -p -t "$pane_id" -S -40
+```
+
+For a known interactive application, wait only when the requested action depends on readiness and its ready state is not yet visible. Poll startup every 250 milliseconds for up to 10 seconds, stopping as soon as the expected command and application chrome appear. Do not add a fixed sleep when the first capture is already ready.
+
+After readiness is verified, send literal input and its application-specific submit key in one tmux invocation, then take a best-effort snapshot:
+
+```bash
+tmux send-keys -t "$pane_id" -l -- "$text" \; send-keys -t "$pane_id" '<submit-key>' \; run-shell 'true' \; capture-pane -p -t "$pane_id" -S -80
+```
+
+The immediate snapshot may precede application output. Poll further only when the task has an explicit readiness or completion condition. Do not wait for an interactive application to exit merely to prove that input was accepted.
 
 ## Inspect tmux
 
@@ -81,13 +174,13 @@ Capture before interacting with an existing process when its current state matte
 
 ## Create Windows and Panes
 
-Resolve the source pane and cwd first. When the command is known, launch it atomically and leave a shell available after it exits. This is the default path for a new pane, but retaining the shell forfeits the launched command's exact exit status:
+Resolve the source pane and cwd first. When the command is known, launch it atomically and pass its executable and arguments directly. This is the default for interactive applications and persistent processes:
 
 ```bash
-tmux split-window -h -d -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd' 'command_here; exec "${SHELL:-/bin/sh}"'
+tmux split-window -h -d -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd' command_name arg1 arg2
 ```
 
-Use `-h` for a pane to the right and `-v` for a pane below. The final argument is shell source; shell-quote every interpolated path and argument. For a persistent process, the same form leaves it running and opens the shell only after it exits.
+Use `-h` for a pane to the right and `-v` for a pane below. tmux accepts `shell-command [argument ...]`; preserve argument boundaries instead of joining user input into shell source. An interactive or persistent process keeps the pane alive. A one-shot command exits with the pane unless the exact-status workflow below is used.
 
 Capture the new pane ID from stdout, then take one immediate output snapshot. Monitor further only when the task has an explicit completion or readiness condition that is not yet visible.
 
@@ -99,10 +192,10 @@ tmux split-window -h -d -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd'
 
 Reinspect an empty pane before sending input to it.
 
-Use a separate window for independent or background work that does not need to remain visible beside the source pane:
+Use a separate window (tab) for independent or background work that does not need to remain visible beside the source pane:
 
 ```bash
-tmux new-window -d -P -F '#{window_id} #{pane_id}' -t '$1:' -n '<label>' -c '/absolute/cwd' 'command_here; exec "${SHELL:-/bin/sh}"'
+tmux new-window -d -P -F '#{window_id} #{pane_id}' -t '$1' -n '<label>' -c '/absolute/cwd' command_name arg1 arg2
 ```
 
 Capture both IDs from stdout, then reinspect the window and its initial pane. Use names only as human-readable labels.
@@ -158,7 +251,7 @@ The snapshot is not completion detection. A returned prompt shows that the shell
 
 ## Monitor Processes
 
-Before starting a persistent process, look for one already running in the target project:
+Before starting a persistent process, look for one already running in the target project unless the user explicitly requested a new pane, window, or separate process:
 
 1. Search the current window, then the current session, expanding further only when the project may be elsewhere.
 2. Match candidates by cwd and command or process tree; capture output only from likely candidates.
@@ -192,6 +285,8 @@ Before sending input to a TUI:
 
 Do not assume Enter submits across applications. Do not navigate or mutate an unfamiliar TUI by guessing keybindings.
 
+Some TUIs coalesce repeated navigation keys that arrive within one terminal read. Prefer one key event followed by verification. When a short repeated sequence has already been shown to coalesce, keep it in one tmux command queue but separate key events with the smallest observed working interval, starting at 50 milliseconds. Do not add this pacing to ordinary text or single-key input.
+
 When a dedicated skill or control CLI exists, use it instead:
 
 - For Hunk, load `hunk-review` and use `hunk session *`; do not drive the Hunk TUI through tmux keystrokes.
@@ -201,16 +296,23 @@ When a dedicated skill or control CLI exists, use it instead:
 
 OpenCode may run beneath a wrapper shell, so `pane_current_command` can report `zsh` or another shell while the TUI remains active. Treat a previously known OpenCode pane or recognizable OpenCode TUI capture as OpenCode, then confirm with that pane's process tree when needed. Do not rely on the title alone.
 
-Before launching another TUI, inventory existing panes. Reuse an OpenCode pane only when its cwd matches the requested project and reusing its conversation is appropriate.
+Before launching another TUI, inventory existing panes unless the user explicitly requested a new split. Reuse an OpenCode pane only when its cwd matches the requested project and reusing its conversation is appropriate.
 
-In a new pane or window, launch OpenCode directly as the creation command. Launch it in an existing pane only after a capture and process check establish that the pane is an idle shell with no child TUI:
+In a new pane or window, launch OpenCode directly as the creation command. When the first prompt is already known, pass it with `--prompt` so startup and submission are atomic:
+
+```bash
+tmux split-window -h -d -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd' opencode
+tmux split-window -h -d -P -F '#{pane_id}' -t '%48' -c '/absolute/cwd' opencode --prompt "$prompt"
+```
+
+Use `opencode run "$prompt"` instead when the task is intentionally one-shot and an ongoing TUI is unnecessary. Launch OpenCode in an existing pane only after a capture and process check establish that the pane is an idle shell with no child TUI:
 
 ```bash
 tmux send-keys -t '%57' -l -- 'opencode'
 tmux send-keys -t '%57' Enter
 ```
 
-Poll pane metadata until `pane_current_command` is `opencode`, then capture output to confirm the TUI is ready. If startup fails, report the pane output instead of retrying blindly.
+Poll pane metadata and output every 250 milliseconds for up to 10 seconds until either `pane_current_command` is `opencode`, or the pane's process tree and capture confirm the OpenCode TUI is ready beneath a shell wrapper. Stop on the first ready capture. If startup fails, report the pane output instead of retrying blindly.
 
 OpenCode can be launched with explicit options when requested:
 
@@ -226,14 +328,18 @@ Do not invent a session ID. Resolve sessions with `opencode session list --forma
 
 This setup submits OpenCode input with `Ctrl+Y`. Return inserts a newline. Use the known submit binding directly; do not reread `tui.jsonc` on every prompt.
 
-Send prompt text literally, then submit separately:
+Send prompt text literally, then submit with a separate key command in the same tmux invocation:
 
 ```bash
-tmux send-keys -t '%57' -l -- 'Prompt text'
-tmux send-keys -t '%57' C-y
+tmux send-keys -t '%57' -l -- 'Prompt text' \; send-keys -t '%57' C-y
 ```
 
-For multiline prompts, send the full text literally and submit once with `C-y` at the end.
+For multiline prompts, use OpenCode's live bracketed-paste mode so newline bytes are treated as pasted content rather than individual key events, then submit once with `C-y`:
+
+```bash
+payload=$(printf '\033[200~%s\033[201~' "$prompt")
+tmux send-keys -t '%57' -l -- "$payload" \; send-keys -t '%57' C-y
+```
 
 Read the active `tui.json` or `tui.jsonc` only when `C-y` does not submit, the user says the binding changed, or the target instance is known to use different configuration. Prefer an explicit `OPENCODE_TUI_CONFIG`, then project TUI config, then global TUI config. Do not assume Enter submits.
 
